@@ -6,7 +6,8 @@ import FanControl from "./components/FanControl";
 import MetricCard from "./components/MetricCard";
 import StatusBadge from "./components/StatusBadge";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:4000";
+const DEFAULT_API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:4000`;
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE_URL;
 
 function getStatus(co2) {
   if (co2 < 800) {
