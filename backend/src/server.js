@@ -42,11 +42,12 @@ app.use(
   })
 );
 app.use(express.json());
-
-app.get("/api/data", (_request, response) => {
-  response.json(sensorService.getSnapshot());
+app.get("/api/data", (req, res) => {
+  res.json({
+    current: sensorService.latestReading,
+    history: sensorService.history,
+  });
 });
-
 app.post("/api/fan", (request, response) => {
   const requestedValue = request.body?.enabled;
   const nextEnabled =
@@ -96,7 +97,30 @@ io.on("connection", (socket) => {
   });
 });
 
-sensorService.start(io);
+//sensorService.start(io);
+app.post("/api/data", (req, res) => {
+  const value = req.body.value;
+
+  const reading = {
+    co2: value,
+    temperature: 30,
+    humidity: 60,
+    fanEnabled: sensorService.fanEnabled,
+    status: value < 800 ? "good" : value <= 1200 ? "warning" : "critical",
+    timestamp: new Date().toISOString(),
+  };
+
+  sensorService.latestReading = reading;
+  sensorService.pushReading(reading);
+
+  // 🔥 gửi realtime lên web
+  io.emit("sensor:update", {
+    current: reading,
+    fanEnabled: sensorService.fanEnabled,
+  });
+
+  res.send("OK");
+});
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`CO2 backend listening on http://0.0.0.0:${PORT}`);
