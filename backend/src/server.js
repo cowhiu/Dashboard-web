@@ -99,21 +99,21 @@ io.on("connection", (socket) => {
 
 //sensorService.start(io);
 app.post("/api/data", (req, res) => {
-  const value = req.body.value;
+  const { CO2, Temperature, Humidity } = req.body;
 
   const reading = {
-    co2: value,
-    temperature: 30,
-    humidity: 60,
+    co2: CO2,
+    temperature: Temperature,
+    humidity: Humidity,
     fanEnabled: sensorService.fanEnabled,
-    status: value < 800 ? "good" : value <= 1200 ? "warning" : "critical",
+    status: CO2 < 800 ? "good" : CO2 <= 1200 ? "warning" : "critical",
     timestamp: new Date().toISOString(),
   };
 
   sensorService.latestReading = reading;
   sensorService.pushReading(reading);
 
-  // 🔥 gửi realtime lên web
+  // gửi realtime lên web
   io.emit("sensor:update", {
     current: reading,
     fanEnabled: sensorService.fanEnabled,
