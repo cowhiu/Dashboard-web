@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import AlertBanner from "./components/AlertBanner";
 import Co2Chart from "./components/Co2Chart";
@@ -8,6 +8,7 @@ import StatusBadge from "./components/StatusBadge";
 
 const DEFAULT_API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:4000`;
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE_URL;
+const HISTORY_LIMIT = 600;
 
 function getStatus(co2) {
   if (co2 < 800) {
@@ -54,6 +55,99 @@ function getStatusMessage(status) {
   return "Ventilation is urgently needed to bring CO2 back down.";
 }
 
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toTimestampMs(value) {
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizeReading(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const co2 = toFiniteNumber(raw.co2);
+  const temperature = toFiniteNumber(raw.temperature);
+  const humidityRaw = raw.humidity;
+  const humidity = humidityRaw == null ? null : toFiniteNumber(humidityRaw);
+  const timestampMs = toTimestampMs(raw.timestamp);
+
+  if (co2 === null || temperature === null || timestampMs === null) {
+    return null;
+  }
+
+  if (humidityRaw != null && humidity === null) {
+    return null;
+  }
+
+  return {
+    co2,
+    temperature,
+    humidity,
+    timestamp: new Date(timestampMs).toISOString(),
+  };
+}
+
+function normalizeHistory(rawHistory) {
+  if (!Array.isArray(rawHistory)) {
+    return [];
+  }
+
+  const byTimestamp = new Map();
+
+  for (const item of rawHistory) {
+    const normalized = normalizeReading(item);
+    if (!normalized) {
+      continue;
+    }
+    byTimestamp.set(normalized.timestamp, normalized);
+  }
+
+  return [...byTimestamp.values()]
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+    .slice(-HISTORY_LIMIT);
+}
+
+function sameReading(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.co2 === b.co2 &&
+    a.temperature === b.temperature &&
+    a.humidity === b.humidity &&
+    a.timestamp === b.timestamp
+  );
+}
+
+function mergeHistory(previousHistory, reading) {
+  const incomingTs = toTimestampMs(reading.timestamp);
+  if (incomingTs === null) {
+    return previousHistory;
+  }
+
+  if (previousHistory.length === 0) {
+    return [reading];
+  }
+
+  const last = previousHistory[previousHistory.length - 1];
+  const lastTs = toTimestampMs(last.timestamp);
+
+  if (lastTs !== null && incomingTs <= lastTs) {
+    return previousHistory; // duplicate timestamp or backward time jump
+  }
+
+  const next = [...previousHistory, reading];
+  if (next.length > HISTORY_LIMIT) {
+    next.splice(0, next.length - HISTORY_LIMIT);
+  }
+
+  return next;
+}
+
 function App() {
   const [current, setCurrent] = useState(null);
   const [history, setHistory] = useState([]);
@@ -63,86 +157,181 @@ function App() {
   const [error, setError] = useState("");
   const [fanPending, setFanPending] = useState(false);
 
-  useEffect(() => {
-    let active = true;
+  const aliveRef = useRef(true);
+  const lastAcceptedTsRef = useRef(-Infinity);
 
-    const applySnapshot = (snapshot) => {
-      if (!snapshot || !active) {
-        return;
+  const applySnapshot = useCallback((snapshot) => {
+    if (!snapshot || !aliveRef.current) {
+      return;
+    }
+
+    const normalizedHistory = normalizeHistory(snapshot.history);
+    const normalizedCurrent = normalizeReading(snapshot.current);
+    const fallbackCurrent =
+      normalizedHistory.length > 0 ? normalizedHistory[normalizedHistory.length - 1] : null;
+    const nextCurrent = normalizedCurrent ?? fallbackCurrent;
+
+    const snapshotLatestTs =
+      nextCurrent && toTimestampMs(nextCurrent.timestamp) !== null
+        ? toTimestampMs(nextCurrent.timestamp)
+        : -Infinity;
+
+    // Ignore stale snapshots for sensor data but still accept fan state.
+    if (snapshotLatestTs < lastAcceptedTsRef.current) {
+      if (typeof snapshot.fanEnabled === "boolean") {
+        setFanEnabled((prev) => (prev === snapshot.fanEnabled ? prev : snapshot.fanEnabled));
       }
-
-      setCurrent(snapshot.current);
-      setHistory(snapshot.history ?? []);
-      setFanEnabled(Boolean(snapshot.fanEnabled));
       setError("");
-    };
+      return;
+    }
 
-    const loadSnapshot = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/data`);
+    lastAcceptedTsRef.current = snapshotLatestTs;
 
-        if (!response.ok) {
-          throw new Error("Failed to load sensor snapshot.");
+    setCurrent((prev) => (sameReading(prev, nextCurrent) ? prev : nextCurrent));
+
+    setHistory((prev) => {
+      if (prev.length === normalizedHistory.length) {
+        let identical = true;
+        for (let i = 0; i < prev.length; i += 1) {
+          if (!sameReading(prev[i], normalizedHistory[i])) {
+            identical = false;
+            break;
+          }
         }
-
-        const snapshot = await response.json();
-        applySnapshot(snapshot);
-      } catch (loadError) {
-        if (active) {
-          setError(loadError.message || "Unable to reach backend.");
-        }
-      } finally {
-        if (active) {
-          setLoading(false);
+        if (identical) {
+          return prev;
         }
       }
-    };
+      return normalizedHistory;
+    });
 
-    loadSnapshot();
+    if (typeof snapshot.fanEnabled === "boolean") {
+      setFanEnabled((prev) => (prev === snapshot.fanEnabled ? prev : snapshot.fanEnabled));
+    }
+
+    setError("");
+  }, []);
+
+  const fetchSnapshot = useCallback(async () => {
+    const response = await fetch(`${API_BASE_URL}/api/data`);
+    if (!response.ok) {
+      throw new Error("Failed to load sensor snapshot.");
+    }
+    const snapshot = await response.json();
+    applySnapshot(snapshot);
+  }, [applySnapshot]);
+
+  useEffect(() => {
+    aliveRef.current = true;
 
     const socket = io(API_BASE_URL, {
       transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 3000,
+      timeout: 10000,
     });
 
-    socket.on("connect", () => {
+    const handleConnect = () => {
+      if (!aliveRef.current) return;
       setConnected(true);
-    });
 
-    socket.on("disconnect", () => {
+      // Re-sync after every (re)connect to recover missed events.
+      fetchSnapshot()
+        .then(() => {
+          if (aliveRef.current) setError("");
+        })
+        .catch((loadError) => {
+          if (aliveRef.current) {
+            setError(loadError.message || "Unable to reach backend.");
+          }
+        })
+        .finally(() => {
+          if (aliveRef.current) setLoading(false);
+        });
+    };
+
+    const handleDisconnect = () => {
+      if (!aliveRef.current) return;
       setConnected(false);
-    });
+    };
 
-    socket.on("sensor:init", (snapshot) => {
+    const handleConnectError = () => {
+      if (!aliveRef.current) return;
+      setConnected(false);
+    };
+
+    const handleSensorInit = (snapshot) => {
+      if (!aliveRef.current) return;
       applySnapshot(snapshot);
       setLoading(false);
-    });
+    };
 
-    socket.on("sensor:update", (payload) => {
-      if (!active || !payload?.current) {
-        return;
+    const handleSensorUpdate = (payload) => {
+      if (!aliveRef.current) return;
+
+      const reading = normalizeReading(payload?.current);
+      if (!reading) {
+        return; // defensive: ignore malformed payload
       }
 
-      setCurrent(payload.current);
-      setHistory((previousHistory) => [...previousHistory, payload.current].slice(-600));
-
-      if (typeof payload.fanEnabled === "boolean") {
-        setFanEnabled(payload.fanEnabled);
-      }
-    });
-
-    socket.on("fan:update", (payload) => {
-      if (!active) {
-        return;
+      const incomingTs = toTimestampMs(reading.timestamp);
+      if (incomingTs === null || incomingTs <= lastAcceptedTsRef.current) {
+        return; // duplicate timestamp or backward time jump
       }
 
-      setFanEnabled(Boolean(payload?.fanEnabled));
-    });
+      lastAcceptedTsRef.current = incomingTs;
+
+      setCurrent((prev) => (sameReading(prev, reading) ? prev : reading));
+      setHistory((previousHistory) => mergeHistory(previousHistory, reading));
+
+      if (typeof payload?.fanEnabled === "boolean") {
+        setFanEnabled((prev) => (prev === payload.fanEnabled ? prev : payload.fanEnabled));
+      }
+
+      setError("");
+    };
+
+    const handleFanUpdate = (payload) => {
+      if (!aliveRef.current) return;
+      if (typeof payload?.fanEnabled === "boolean") {
+        setFanEnabled((prev) => (prev === payload.fanEnabled ? prev : payload.fanEnabled));
+      }
+    };
+
+    socket.on("connect", handleConnect);
+    socket.on("disconnect", handleDisconnect);
+    socket.on("connect_error", handleConnectError);
+    socket.on("sensor:init", handleSensorInit);
+    socket.on("sensor:update", handleSensorUpdate);
+    socket.on("fan:update", handleFanUpdate);
+
+    // Initial REST snapshot (works before socket init event or if init is missed).
+    fetchSnapshot()
+      .then(() => {
+        if (aliveRef.current) setError("");
+      })
+      .catch((loadError) => {
+        if (aliveRef.current) {
+          setError(loadError.message || "Unable to reach backend.");
+        }
+      })
+      .finally(() => {
+        if (aliveRef.current) setLoading(false);
+      });
 
     return () => {
-      active = false;
+      aliveRef.current = false;
+      socket.off("connect", handleConnect);
+      socket.off("disconnect", handleDisconnect);
+      socket.off("connect_error", handleConnectError);
+      socket.off("sensor:init", handleSensorInit);
+      socket.off("sensor:update", handleSensorUpdate);
+      socket.off("fan:update", handleFanUpdate);
       socket.disconnect();
     };
-  }, []);
+  }, [applySnapshot, fetchSnapshot]);
 
   const handleToggleFan = async () => {
     setFanPending(true);
@@ -172,11 +361,14 @@ function App() {
     }
   };
 
-  const status = getStatus(current?.co2 ?? 0);
-  const alertActive = isSustainedAlert(history);
-  const updatedAt = current?.timestamp ? formatUpdatedAt(current.timestamp) : "--";
-  const statusMessage = getStatusMessage(status);
-  const co2Fill = Math.min(((current?.co2 ?? 0) / 1500) * 100, 100);
+  const status = useMemo(() => getStatus(current?.co2 ?? 0), [current?.co2]);
+  const alertActive = useMemo(() => isSustainedAlert(history), [history]);
+  const updatedAt = useMemo(
+    () => (current?.timestamp ? formatUpdatedAt(current.timestamp) : "--"),
+    [current?.timestamp]
+  );
+  const statusMessage = useMemo(() => getStatusMessage(status), [status]);
+  const co2Fill = useMemo(() => Math.min(((current?.co2 ?? 0) / 1500) * 100, 100), [current?.co2]);
 
   return (
     <main className="min-h-screen px-4 py-6 sm:px-6 lg:px-8">
@@ -190,7 +382,8 @@ function App() {
               Real-time Indoor Air Dashboard
             </h1>
             <p className="mt-3 max-w-2xl text-sm text-slate-300 sm:text-base">
-              Live classroom air metrics with ventilation status, alerting, and a rolling CO2 trend.
+              Live classroom air metrics with ventilation status, alerting, and a rolling CO2
+              trend.
             </p>
           </div>
 
@@ -268,7 +461,7 @@ function App() {
                 </div>
                 <div className="rounded-2xl border border-white/10 bg-slate-950/30 p-4">
                   <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Stream rate</p>
-                  <p className="mt-2 text-lg font-semibold text-white">1 sample / second</p>
+                  <p className="mt-2 text-lg font-semibold text-white">1 sample / 5 seconds</p>
                 </div>
               </div>
             </div>

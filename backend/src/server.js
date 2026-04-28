@@ -1,141 +1,144 @@
-const http = require("http");
 const express = require("express");
+const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
-const { SensorService } = require("./sensorService");
-
-const PORT = Number(process.env.PORT) || 4000;
-
-// Comma-separated list of allowed origins. If empty, allow all (useful on private networks like Tailscale).
-// Example: CLIENT_ORIGINS="http://100.x.y.z:5173,http://localhost:5173"
-const CLIENT_ORIGINS = (process.env.CLIENT_ORIGINS || "")
-  .split(",")
-  .map((value) => value.trim())
-  .filter(Boolean);
-
-const allowAllOrigins = CLIENT_ORIGINS.length === 0;
-const isOriginAllowed = (origin) => allowAllOrigins || CLIENT_ORIGINS.includes(origin);
-
-const corsOrigin = (origin, callback) => {
-  if (!origin) {
-    callback(null, true);
-    return;
-  }
-
-  callback(null, isOriginAllowed(origin));
-};
 
 const app = express();
+app.use(cors());
+app.use(express.json());
+
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: corsOrigin,
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*" },
 });
 
-const sensorService = new SensorService();
+// In-memory state
+let latestReading = null;
+let history = [];
+let fanEnabled = false;
 
-app.use(
-  cors({
-    origin: corsOrigin,
-  })
-);
-app.use(express.json());
-app.get("/api/data", (req, res) => {
-  res.json({
-    current: sensorService.latestReading,
-    history: sensorService.history,
-  });
-});
-app.post("/api/fan", (request, response) => {
-  const requestedValue = request.body?.enabled;
-  const nextEnabled =
-    typeof requestedValue === "boolean" ? requestedValue : !sensorService.fanEnabled;
-  const fanEnabled = sensorService.setFanEnabled(nextEnabled);
-  const changedAt = new Date().toISOString();
+const HISTORY_LIMIT = 1000;
 
-  io.emit("fan:update", {
-    fanEnabled,
-    changedAt,
-  });
+function toNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function co2Status(co2) {
+  if (co2 <= 800) return "good";
+  if (co2 <= 1200) return "warning";
+  return "critical";
+}
+
+function emitSensorUpdate() {
   io.emit("sensor:update", {
-    current: sensorService.latestReading,
+    current: latestReading,
     fanEnabled,
   });
+}
 
-  response.json({
-    fanEnabled,
-    changedAt,
-  });
-});
-
-app.get("/api/health", (_request, response) => {
-  response.json({
-    ok: true,
-  });
-});
-
-io.on("connection", (socket) => {
-  socket.emit("sensor:init", sensorService.getSnapshot());
-
-  socket.on("fan:set", (payload) => {
-    const requestedValue = payload?.enabled;
-    const nextEnabled =
-      typeof requestedValue === "boolean" ? requestedValue : !sensorService.fanEnabled;
-    const fanEnabled = sensorService.setFanEnabled(nextEnabled);
-    const changedAt = new Date().toISOString();
-
-    io.emit("fan:update", {
-      fanEnabled,
-      changedAt,
-    });
-    io.emit("sensor:update", {
-      current: sensorService.latestReading,
-      fanEnabled,
-    });
-  });
-});
-
-//sensorService.start(io);
+// POST /api/data
 app.post("/api/data", (req, res) => {
-  const { CO2, Temperature, Humidity } = req.body;
+  // Accept typical ESP32 field variants, then normalize
+  const rawCo2 = req.body.CO2 ?? req.body.co2 ?? null;
+  const rawTemperature = req.body.Temperature ?? req.body.temperature ?? null;
+  const rawHumidity = req.body.Humidity ?? req.body.humidity ?? null;
+
+  const co2Num = toNumberOrNull(rawCo2);
+  const tempNum = toNumberOrNull(rawTemperature);
+  const humidityNum = toNumberOrNull(rawHumidity);
+
+  // Validate CO2: integer, 300-10000
+  if (co2Num === null || !Number.isInteger(co2Num)) {
+    return res.status(400).json({ error: "CO2 must be an integer." });
+  }
+  if (co2Num < 300 || co2Num > 10000) {
+    return res.status(400).json({ error: "CO2 must be between 300 and 10000." });
+  }
+
+  // Validate temperature: float, -40 to 85
+  if (tempNum === null) {
+    return res.status(400).json({ error: "Temperature must be a number." });
+  }
+  if (tempNum < -40 || tempNum > 85) {
+    return res.status(400).json({ error: "Temperature must be between -40 and 85." });
+  }
+
+  // Humidity is nullable float
+  if (rawHumidity !== null && rawHumidity !== undefined && rawHumidity !== "" && humidityNum === null) {
+    return res.status(400).json({ error: "Humidity must be a number or null." });
+  }
 
   const reading = {
-    co2: CO2,
-    temperature: Temperature,
-    humidity: Humidity,
-    fanEnabled: sensorService.fanEnabled,
-    status: CO2 < 800 ? "good" : CO2 <= 1200 ? "warning" : "critical",
+    co2: co2Num,
+    temperature: tempNum,
+    humidity: humidityNum === null ? null : humidityNum,
+    status: co2Status(co2Num),
     timestamp: new Date().toISOString(),
   };
 
-  sensorService.latestReading = reading;
-  sensorService.pushReading(reading);
+  latestReading = reading;
+  history.push(reading);
+  if (history.length > HISTORY_LIMIT) {
+    history.shift();
+  }
 
-  // gửi realtime lên web
-  io.emit("sensor:update", {
-    current: reading,
-    fanEnabled: sensorService.fanEnabled,
+  emitSensorUpdate();
+
+  return res.status(200).json({
+    current: latestReading,
+    fanEnabled,
+  });
+});
+
+// GET /api/data
+app.get("/api/data", (_req, res) => {
+  res.json({
+    current: latestReading,
+    history,
+  });
+});
+
+// POST /api/fan
+// body.enabled boolean => set explicitly, otherwise toggle
+app.post("/api/fan", (req, res) => {
+  if (typeof req.body?.enabled === "boolean") {
+    fanEnabled = req.body.enabled;
+  } else {
+    fanEnabled = !fanEnabled;
+  }
+
+  io.emit("fan:update", { fanEnabled });
+  emitSensorUpdate();
+
+  res.json({ fanEnabled });
+});
+
+// Socket.IO
+io.on("connection", (socket) => {
+  socket.emit("sensor:init", {
+    current: latestReading,
+    history,
+    fanEnabled,
   });
 
-  res.send("OK");
+  socket.on("fan:set", (payload) => {
+    if (typeof payload === "boolean") {
+      fanEnabled = payload;
+    } else if (typeof payload?.enabled === "boolean") {
+      fanEnabled = payload.enabled;
+    } else {
+      return;
+    }
+
+    io.emit("fan:update", { fanEnabled });
+    emitSensorUpdate();
+  });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`CO2 backend listening on http://0.0.0.0:${PORT}`);
-  if (!allowAllOrigins) {
-    console.log(`Allowed origins: ${CLIENT_ORIGINS.join(", ")}`);
-  }
-});
-
-process.on("SIGINT", () => {
-  sensorService.stop();
-  server.close(() => process.exit(0));
-});
-
-process.on("SIGTERM", () => { 
-  sensorService.stop();
-  server.close(() => process.exit(0));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
 
