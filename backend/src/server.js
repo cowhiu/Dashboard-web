@@ -115,6 +115,13 @@ app.post("/api/fan", (req, res) => {
   res.json({ fanEnabled });
 });
 
+// GET /api/fan
+app.get("/api/fan", (req, res) => {
+  res.json({
+    fanEnabled,
+  });
+});
+
 // Socket.IO
 io.on("connection", (socket) => {
   socket.emit("sensor:init", {
