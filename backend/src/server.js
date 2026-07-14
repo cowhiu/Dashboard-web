@@ -26,8 +26,8 @@ let alertEmailInFlight = false;
 
 const HISTORY_LIMIT = 1000;
 const CO2_ALERT_THRESHOLD = 1200;
-const CO2_ALERT_DURATION_MS = 15 * 60 * 1000;
-
+// const CO2_ALERT_DURATION_MS = 15 * 60 * 1000;
+const CO2_ALERT_DURATION_MS = 0;
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 function toNumberOrNull(value) {
