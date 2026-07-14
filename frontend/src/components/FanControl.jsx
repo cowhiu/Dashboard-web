@@ -1,11 +1,21 @@
-function FanControl({ fanEnabled, pending, onToggle }) {
+function FanControl({ fanEnabled, manualMode, pending, onToggle }) {
   return (
     <section className="rounded-3xl border border-white/10 bg-white/5 p-5 shadow-panel backdrop-blur">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <p className="text-sm font-medium uppercase tracking-[0.18em] text-slate-400">
-            Ventilation Fan
-          </p>
+          <div className="flex items-center gap-3">
+            <p className="text-sm font-medium uppercase tracking-[0.18em] text-slate-400">
+              Ventilation Fan
+            </p>
+            <button
+              type="button"
+              onClick={onToggle}
+              disabled={pending}
+              className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-teal-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {manualMode ? "AUTO OFF" : "AUTO ON"}
+            </button>
+          </div>
           <p className="mt-3 font-display text-2xl font-semibold text-white">
             {fanEnabled ? "Running" : "Standby"}
           </p>

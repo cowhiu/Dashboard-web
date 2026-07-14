@@ -152,6 +152,7 @@ function App() {
   const [current, setCurrent] = useState(null);
   const [history, setHistory] = useState([]);
   const [fanEnabled, setFanEnabled] = useState(false);
+  const [manualMode, setManualMode] = useState(false);
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -159,6 +160,20 @@ function App() {
 
   const aliveRef = useRef(true);
   const lastAcceptedTsRef = useRef(-Infinity);
+
+  const applyFanState = useCallback((snapshot) => {
+    if (!snapshot || !aliveRef.current) {
+      return;
+    }
+
+    if (typeof snapshot.fanEnabled === "boolean") {
+      setFanEnabled((prev) => (prev === snapshot.fanEnabled ? prev : snapshot.fanEnabled));
+    }
+
+    if (typeof snapshot.manualMode === "boolean") {
+      setManualMode((prev) => (prev === snapshot.manualMode ? prev : snapshot.manualMode));
+    }
+  }, []);
 
   const applySnapshot = useCallback((snapshot) => {
     if (!snapshot || !aliveRef.current) {
@@ -178,9 +193,7 @@ function App() {
 
     // Ignore stale snapshots for sensor data but still accept fan state.
     if (snapshotLatestTs < lastAcceptedTsRef.current) {
-      if (typeof snapshot.fanEnabled === "boolean") {
-        setFanEnabled((prev) => (prev === snapshot.fanEnabled ? prev : snapshot.fanEnabled));
-      }
+      applyFanState(snapshot);
       setError("");
       return;
     }
@@ -205,12 +218,10 @@ function App() {
       return normalizedHistory;
     });
 
-    if (typeof snapshot.fanEnabled === "boolean") {
-      setFanEnabled((prev) => (prev === snapshot.fanEnabled ? prev : snapshot.fanEnabled));
-    }
+    applyFanState(snapshot);
 
     setError("");
-  }, []);
+  }, [applyFanState]);
 
   const fetchSnapshot = useCallback(async () => {
     const response = await fetch(`${API_BASE_URL}/api/data`);
@@ -220,6 +231,16 @@ function App() {
     const snapshot = await response.json();
     applySnapshot(snapshot);
   }, [applySnapshot]);
+
+  const fetchFanSnapshot = useCallback(async () => {
+    const response = await fetch(`${API_BASE_URL}/api/fan`);
+    if (!response.ok) {
+      throw new Error("Failed to load fan snapshot.");
+    }
+
+    const snapshot = await response.json();
+    applyFanState(snapshot);
+  }, [applyFanState]);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -250,6 +271,10 @@ function App() {
         .finally(() => {
           if (aliveRef.current) setLoading(false);
         });
+
+      fetchFanSnapshot().catch(() => {
+        // Keep reconnect flow resilient if fan state cannot be fetched momentarily.
+      });
     };
 
     const handleDisconnect = () => {
@@ -277,8 +302,13 @@ function App() {
       }
 
       const incomingTs = toTimestampMs(reading.timestamp);
-      if (incomingTs === null || incomingTs <= lastAcceptedTsRef.current) {
+      if (incomingTs === null) {
         return; // duplicate timestamp or backward time jump
+      }
+
+      if (incomingTs <= lastAcceptedTsRef.current) {
+        applyFanState(payload);
+        return;
       }
 
       lastAcceptedTsRef.current = incomingTs;
@@ -286,18 +316,14 @@ function App() {
       setCurrent((prev) => (sameReading(prev, reading) ? prev : reading));
       setHistory((previousHistory) => mergeHistory(previousHistory, reading));
 
-      if (typeof payload?.fanEnabled === "boolean") {
-        setFanEnabled((prev) => (prev === payload.fanEnabled ? prev : payload.fanEnabled));
-      }
+      applyFanState(payload);
 
       setError("");
     };
 
     const handleFanUpdate = (payload) => {
       if (!aliveRef.current) return;
-      if (typeof payload?.fanEnabled === "boolean") {
-        setFanEnabled((prev) => (prev === payload.fanEnabled ? prev : payload.fanEnabled));
-      }
+      applyFanState(payload);
     };
 
     socket.on("connect", handleConnect);
@@ -321,6 +347,10 @@ function App() {
         if (aliveRef.current) setLoading(false);
       });
 
+    fetchFanSnapshot().catch(() => {
+      // Keep the dashboard live even if the fan snapshot is temporarily unavailable.
+    });
+
     return () => {
       aliveRef.current = false;
       socket.off("connect", handleConnect);
@@ -331,7 +361,7 @@ function App() {
       socket.off("fan:update", handleFanUpdate);
       socket.disconnect();
     };
-  }, [applySnapshot, fetchSnapshot]);
+  }, [applySnapshot, fetchFanSnapshot, fetchSnapshot]);
 
   const handleToggleFan = async () => {
     setFanPending(true);
@@ -343,7 +373,7 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          enabled: !fanEnabled,
+          manualMode: !manualMode,
         }),
       });
 
@@ -352,7 +382,7 @@ function App() {
       }
 
       const result = await response.json();
-      setFanEnabled(Boolean(result.fanEnabled));
+      applyFanState(result);
       setError("");
     } catch (requestError) {
       setError(requestError.message || "Unable to update fan state.");
@@ -500,7 +530,12 @@ function App() {
             <Co2Chart history={history} />
           </section>
 
-          <FanControl fanEnabled={fanEnabled} pending={fanPending} onToggle={handleToggleFan} />
+          <FanControl
+            fanEnabled={fanEnabled}
+            manualMode={manualMode}
+            pending={fanPending}
+            onToggle={handleToggleFan}
+          />
         </section>
       </div>
     </main>

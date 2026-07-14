@@ -12,5 +12,9 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "resend": "^6.17.2"
   }
 }

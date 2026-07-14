@@ -1,6 +1,9 @@
+require("dotenv").config();
+
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
+const { Resend } = require("resend");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -16,8 +19,16 @@ const io = new Server(server, {
 let latestReading = null;
 let history = [];
 let fanEnabled = false;
+let manualMode = false;
+let alertHighSince = null;
+let alertEmailSent = false;
+let alertEmailInFlight = false;
 
 const HISTORY_LIMIT = 1000;
+const CO2_ALERT_THRESHOLD = 1200;
+const CO2_ALERT_DURATION_MS = 15 * 60 * 1000;
+
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -31,11 +42,109 @@ function co2Status(co2) {
   return "critical";
 }
 
+function emitFanUpdate() {
+  io.emit("fan:update", {
+    fanEnabled,
+    manualMode,
+  });
+}
+
 function emitSensorUpdate() {
   io.emit("sensor:update", {
     current: latestReading,
     fanEnabled,
+    manualMode,
   });
+}
+
+function resetCo2AlertState() {
+  alertHighSince = null;
+  alertEmailSent = false;
+  alertEmailInFlight = false;
+}
+
+function formatHumidity(value) {
+  return value === null || value === undefined ? "N/A" : `${value}`;
+}
+
+async function sendCo2AlertEmail(reading) {
+  if (!resend || !process.env.ALERT_EMAIL) {
+    return;
+  }
+
+  const from = process.env.ALERT_FROM_EMAIL || "Classroom CO2 Alert <onboarding@resend.dev>";
+  const subject = "⚠️ Classroom CO₂ Alert";
+  const text = [
+    "The classroom CO₂ concentration has exceeded 1200 ppm continuously for more than 15 minutes.",
+    "",
+    "Current CO₂:",
+    `${reading.co2} ppm`,
+    "",
+    "Temperature:",
+    `${reading.temperature} °C`,
+    "",
+    "Humidity:",
+    `${formatHumidity(reading.humidity)} %`,
+    "",
+    "Time:",
+    reading.timestamp,
+    "",
+    "Please improve classroom ventilation immediately.",
+  ].join("\n");
+
+  await resend.emails.send({
+    from,
+    to: [process.env.ALERT_EMAIL],
+    subject,
+    text,
+  });
+}
+
+function evaluateCo2Alert(reading) {
+  const readingTime = Date.parse(reading.timestamp);
+  if (!Number.isFinite(readingTime)) {
+    return;
+  }
+
+  if (reading.co2 <= CO2_ALERT_THRESHOLD) {
+    resetCo2AlertState();
+    return;
+  }
+
+  if (alertHighSince === null) {
+    alertHighSince = readingTime;
+  }
+
+  if (alertEmailSent || alertEmailInFlight) {
+    return;
+  }
+
+  if (readingTime - alertHighSince < CO2_ALERT_DURATION_MS) {
+    return;
+  }
+
+  alertEmailInFlight = true;
+
+  void sendCo2AlertEmail(reading)
+    .then(() => {
+      alertEmailSent = true;
+    })
+    .catch((error) => {
+      console.error("Failed to send CO2 alert email:", error);
+    })
+    .finally(() => {
+      alertEmailInFlight = false;
+    });
+}
+
+function applyFanState(nextState) {
+  if (typeof nextState?.fanEnabled === "boolean") {
+    fanEnabled = nextState.fanEnabled;
+  }
+
+  if (typeof nextState?.manualMode === "boolean") {
+    manualMode = nextState.manualMode;
+  }
 }
 
 // POST /api/data
@@ -85,10 +194,12 @@ app.post("/api/data", (req, res) => {
   }
 
   emitSensorUpdate();
+  evaluateCo2Alert(reading);
 
   return res.status(200).json({
     current: latestReading,
     fanEnabled,
+    manualMode,
   });
 });
 
@@ -97,28 +208,28 @@ app.get("/api/data", (_req, res) => {
   res.json({
     current: latestReading,
     history,
+    fanEnabled,
+    manualMode,
   });
 });
 
-// POST /api/fan
-// body.enabled boolean => set explicitly, otherwise toggle
 app.post("/api/fan", (req, res) => {
-  if (typeof req.body?.enabled === "boolean") {
-    fanEnabled = req.body.enabled;
-  } else {
-    fanEnabled = !fanEnabled;
-  }
+  applyFanState({
+    fanEnabled: typeof req.body.fanEnabled === "boolean" ? req.body.fanEnabled : undefined,
+    manualMode: typeof req.body.manualMode === "boolean" ? req.body.manualMode : undefined,
+  });
 
-  io.emit("fan:update", { fanEnabled });
+  emitFanUpdate();
   emitSensorUpdate();
 
-  res.json({ fanEnabled });
+  res.json({ fanEnabled, manualMode });
 });
 
 // GET /api/fan
 app.get("/api/fan", (req, res) => {
   res.json({
     fanEnabled,
+    manualMode,
   });
 });
 
@@ -128,6 +239,7 @@ io.on("connection", (socket) => {
     current: latestReading,
     history,
     fanEnabled,
+    manualMode,
   });
 
   socket.on("fan:set", (payload) => {
@@ -135,11 +247,17 @@ io.on("connection", (socket) => {
       fanEnabled = payload;
     } else if (typeof payload?.enabled === "boolean") {
       fanEnabled = payload.enabled;
-    } else {
+    }
+
+    if (typeof payload?.manualMode === "boolean") {
+      manualMode = payload.manualMode;
+    }
+
+    if (typeof payload !== "boolean" && typeof payload?.enabled !== "boolean" && typeof payload?.manualMode !== "boolean") {
       return;
     }
 
-    io.emit("fan:update", { fanEnabled });
+    emitFanUpdate();
     emitSensorUpdate();
   });
 });
