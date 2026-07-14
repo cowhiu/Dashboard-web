@@ -1,4 +1,6 @@
-function FanControl({ fanEnabled, manualMode, pending, onToggle }) {
+function FanControl({ fanEnabled, manualMode, pending, onToggleAuto, onToggleFan }) {
+  const fanButtonDisabled = pending || !manualMode;
+
   return (
     <section className="rounded-3xl border border-white/10 bg-white/5 p-5 shadow-panel backdrop-blur">
       <div className="flex items-center justify-between gap-4">
@@ -9,7 +11,7 @@ function FanControl({ fanEnabled, manualMode, pending, onToggle }) {
             </p>
             <button
               type="button"
-              onClick={onToggle}
+              onClick={onToggleAuto}
               disabled={pending}
               className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-teal-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
             >
@@ -32,13 +34,13 @@ function FanControl({ fanEnabled, manualMode, pending, onToggle }) {
 
       <button
         type="button"
-        onClick={onToggle}
-        disabled={pending}
+        onClick={onToggleFan}
+        disabled={fanButtonDisabled}
         className={`mt-6 w-full rounded-2xl px-4 py-3 text-sm font-semibold transition ${
           fanEnabled
             ? "bg-white/8 text-white hover:bg-white/12"
             : "bg-teal-400 text-slate-950 hover:bg-teal-300"
-        } disabled:cursor-not-allowed disabled:opacity-70`}
+        } ${fanButtonDisabled ? "cursor-not-allowed opacity-50" : ""}`}
       >
         {pending ? "Updating..." : fanEnabled ? "Turn Fan Off" : "Turn Fan On"}
       </button>

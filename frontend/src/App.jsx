@@ -363,7 +363,7 @@ function App() {
     };
   }, [applySnapshot, fetchFanSnapshot, fetchSnapshot]);
 
-  const handleToggleFan = async () => {
+  const handleToggleAuto = async () => {
     setFanPending(true);
 
     try {
@@ -374,6 +374,34 @@ function App() {
         },
         body: JSON.stringify({
           manualMode: !manualMode,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to update fan state.");
+      }
+
+      const result = await response.json();
+      applyFanState(result);
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message || "Unable to update fan state.");
+    } finally {
+      setFanPending(false);
+    }
+  };
+
+  const handleToggleFan = async () => {
+    setFanPending(true);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/fan`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          fanEnabled: !fanEnabled,
         }),
       });
 
@@ -534,7 +562,8 @@ function App() {
             fanEnabled={fanEnabled}
             manualMode={manualMode}
             pending={fanPending}
-            onToggle={handleToggleFan}
+            onToggleAuto={handleToggleAuto}
+            onToggleFan={handleToggleFan}
           />
         </section>
       </div>
